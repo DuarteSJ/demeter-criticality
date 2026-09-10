@@ -27,6 +27,9 @@ $(DEMETER_SOURCE_DIR)/.stamp: patch/demeter.patch $(DEMETER_BASE_TARBALL) $(DEME
 	tar -axf $(DEMETER_BASE_TARBALL) --strip-components=1 -C $(DEMETER_SOURCE_DIR)
 	@echo "Applying Demeter patch..."
 	patch -d $(DEMETER_SOURCE_DIR) -p1 < $<
+	@echo "Ubuntu 26.04 host-tool fix (glibc 2.41 const-correct strstr/strchr): exempt -Werror"
+	sed -i 's/override CFLAGS += -Werror -Wall/override CFLAGS += -Werror -Wall -Wno-error=incompatible-pointer-types-discards-qualifiers/' $(DEMETER_SOURCE_DIR)/tools/lib/bpf/Makefile
+	sed -i 's/CFLAGS += -Werror$$/CFLAGS += -Werror -Wno-error=incompatible-pointer-types-discards-qualifiers/' $(DEMETER_SOURCE_DIR)/tools/lib/subcmd/Makefile
 	touch $@
 
 SOTA_BASE_TARBALL = sota-base.tar.gz

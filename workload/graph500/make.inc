@@ -1,2 +1,3 @@
 BUILD_OPENMP = Yes
-CFLAGS = -lm -fopenmp
+CFLAGS = -fopenmp
+LDLIBS = -lm
