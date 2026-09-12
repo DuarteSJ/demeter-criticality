@@ -32,6 +32,41 @@ guest-delegated tiering, in place of its frequency-based hotness.
   balloon (Demeter leaves the provisioning policy open), using each VM's
   aggregate slow-tier stall to size its fast-tier budget.
 
+## Running on Ubuntu 26.04 (port notes)
+
+The upstream artifact targets **Clear Linux + systemd-boot**. This fork is run on
+**Ubuntu 26.04 + a kernel built from the Demeter config + grub**, which needs a
+few adaptations. Build-time fixes are committed in the source; runtime pieces are
+either automated by `script/setup-host.sh` or listed here as one-time host setup.
+
+**Build-time (committed):**
+- `toolchain.mk`: symlink `libxml2.so.2` -> system `libxml2.so.16` (prebuilt
+  `ld.lld`/`clang` need the old soname).
+- `kernel.mk`: after patching, exempt the glibc-2.41 const-string `-Werror` in the
+  host tools `tools/lib/bpf/Makefile` and `tools/lib/subcmd/Makefile`.
+- `workload/graph500/make.inc`: move `-lm` from `CFLAGS` to `LDLIBS` (modern `ld`
+  `--as-needed` drops a lib placed before the objects).
+- `bin.mk`: create the qcow2 root overlays with an **absolute** backing path;
+  cloud-hypervisor resolves a relative backing against its cwd, not the overlay.
+- `bench/bench/utils.py`: pick a **local** (`/etc/group`) group for virtiofsd's
+  `--socket-group`; the static musl virtiofsd cannot resolve an LDAP-only primary
+  group (common on clusters).
+
+**One-time host setup (per machine):**
+- Add your user to the `kvm` group: `sudo usermod -aG kvm "$USER"` (re-login).
+- Passwordless sudo for your user: the bench launches `virtiofsd` via `sudo`
+  non-interactively, so sudo must not prompt
+  (`echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/90-$USER-nopasswd`).
+- Python 3.13 venv: `fire` still does `import pipes` (removed in 3.13); patch it with
+  `sed -i 's/^import pipes/import shlex as pipes/' py313/.../site-packages/fire/{core,trace}.py`.
+- Secure Boot off (unsigned demeterhost kernel), and the host kernel installed via
+  `installkernel` + `update-initramfs -c -k 6.10.0-demeterhost` + `update-grub`.
+
+**Per-boot (automated):** `source script/setup-host.sh` handles netfilter modules,
+swapoff, sysctls, CPU-freq lock, CXL->system-ram, the virtiofsd secure_path
+symlink, the bridge (`network.bash`), and the fd ulimit. `script/functionality-test.sh`
+runs the README smoke test.
+
 ## Not included in this repo (fetched by the build)
 
 - Base kernel trees (vanilla Linux 6.10 for Demeter, 5.15.162 for the

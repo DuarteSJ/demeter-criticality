@@ -13,6 +13,24 @@ LOGGER = logging.getLogger(__name__)
 PAGE_SIZE = 4096
 
 
+def local_socket_group() -> str:
+    """Return a group the current user belongs to that is defined in the local
+    /etc/group. virtiofsd is a static musl binary and resolves groups only from
+    /etc/group (no NSS), so an LDAP-only primary group (common on clusters) makes
+    it fail with "Couldn't resolve the group name". Falls back to the primary
+    group name if no local group is found."""
+    gids = set(os.getgroups()) | {os.getgid()}
+    try:
+        with open("/etc/group") as f:
+            for line in f:
+                fields = line.split(":")
+                if len(fields) >= 3 and fields[2].isdigit() and int(fields[2]) in gids:
+                    return fields[0]
+    except OSError:
+        pass
+    return grp.getgrgid(os.getgid()).gr_name
+
+
 class Kernel(str, Enum):
     demeter = "demeter"
     memtis = "memtis"
@@ -120,7 +138,7 @@ def virtiofsd(shared: Path, socket: Path):
             "--cache=never",
             f"--socket-path={socket}",
             f"--shared-dir={shared}",
-            f"--socket-group={grp.getgrgid(os.getgid()).gr_name}",
+            f"--socket-group={local_socket_group()}",
         ],
         stdout=socket.with_suffix(".stdout"),
         stderr=socket.with_suffix(".stderr"),

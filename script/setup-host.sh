@@ -9,6 +9,10 @@
 #  which would only affect the script's own subshell).
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+REPO="$(cd "$SELF/.." && pwd)"
+
+echo "[setup] symlink staged virtiofsd into secure_path (sudo ignores our PATH)"
+sudo ln -sf "$REPO/bin/virtiofsd" /usr/local/bin/virtiofsd
 
 echo "[setup] kill leftover processes from previous runs"
 echo "cloud-hyperviso virtiofsd pcm-memory gdb" | xargs -n1 sudo pkill -9 2>/dev/null || true
