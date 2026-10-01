@@ -209,7 +209,7 @@ diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
 diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
 --- a/mm/demeter/module.c
 +++ b/mm/demeter/module.c
-@@ -57,6 +57,29 @@
+@@ -57,6 +57,34 @@
  MODULE_PARM_DESC(load_event,
  		 "Load sample event: 0=load latency (default), 1=L3 miss retired (sample period: load_l3_miss_sample_period)");
  
@@ -236,15 +236,21 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
 +MODULE_PARM_DESC(pac_window_ms,
 +		 "PAC attribution window (tick period) in ms, defaults to 20");
 +
++ulong mlp_mode = MLP_MODE_L2;
++module_param_named(mlp_mode, mlp_mode, ulong, 0444);
++MODULE_PARM_DESC(mlp_mode,
++		 "PAC MLP estimate: 1=L2MLP (default)");
++
  DEFINE_STATIC_KEY_TRUE(should_decay_sketch);
  struct kmem_cache *list_head_cache;
  
-@@ -116,6 +139,24 @@
+@@ -116,6 +144,25 @@
  		.exclude_callchain_kernel = 1,
  	},
  };
 +// PAC: counting events for MLP = T1/T2, attached per task like event_attrs
 +// (inherit covers the victim's threads). User-only to match the PEBS samples.
++// Configs below are mlp_mode 1; event_attrs_update_param applies mlp_mode.
 +struct perf_event_attr mlp_attrs[MAX_MLP_COUNTERS] = {
 +	[MLP_OCCUPANCY] = {
 +		.type = PERF_TYPE_RAW,
@@ -264,6 +270,29 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
  static inline void event_attrs_update_param(void)
  {
  	if (load_event == LOAD_EVENT_L3_MISS) {
+@@ -131,6 +178,10 @@
+ 		event_attrs[EVENT_LOAD].config1 = load_latency_threshold;
+ 	}
+ 
++	pr_info("%s: mlp_mode=%lu mlp_configs=%#llx/%#llx\n", __func__,
++		mlp_mode, mlp_attrs[MLP_OCCUPANCY].config,
++		mlp_attrs[MLP_BUSY].config);
++
+ 	// event_attrs[EVENT_LOAD].sample_period = load_l3_miss_sample_period;
+ 	event_attrs[EVENT_STORE].sample_period = retired_stores_sample_period;
+ 	pr_info("%s: load_event=%lu load_config=%#llx local_dram_miss_sample_period=%lu retired_stores_sample_period=%lu load_latency_sample_period=%lu load_latency_threshold=%lu\n",
+@@ -157,6 +208,11 @@
+ 		pr_err("Failed to create list_head cache\n");
+ 		return -ENOMEM;
+ 	}
++	if (mlp_mode < MLP_MODE_L2 || mlp_mode >= MAX_MLP_MODES) {
++		pr_err("invalid mlp_mode=%lu\n", mlp_mode);
++		kmem_cache_destroy(list_head_cache);
++		return -EINVAL;
++	}
+ 	event_attrs_update_param();
+ 	return demeter_sysfs_init();
+ }
 diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
 --- a/mm/demeter/module.h
 +++ b/mm/demeter/module.h
@@ -287,7 +316,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
  enum event_config {
  	MEM_TRANS_RETIRED_LOAD_LATENCY = 0x01cd,
  	MEM_INST_RETIRED_ALL_STORES = 0x82d0,
-@@ -40,19 +53,36 @@
+@@ -40,19 +53,45 @@
  	// the L3-miss load events; the tier is taken from the sample's physical
  	// address, so one supplier-agnostic event covers DRAM and CXL.
  	MEM_LOAD_RETIRED_L3_MISS = 0x20d1,
@@ -303,10 +332,19 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
  	MAX_EVENTS,
  };
 +// PAC: counting (non-sampling) events for the per-window MLP estimate.
++// MLP = MLP_OCCUPANCY / MLP_BUSY, with the events chosen by mlp_mode.
 +enum mlp_counter {
 +	MLP_OCCUPANCY, // T1: sum over cycles of pending demand reads
 +	MLP_BUSY, // T2: cycles with >= 1 pending demand read
 +	MAX_MLP_COUNTERS,
++};
++// How PAC estimates the window's MLP in S = k * misses_slow / MLP. All are
++// per VM and per window (no core counter is per tier).
++enum mlp_mode_kind {
++	// L2MLP: pending L2-miss demand reads (includes L3 hits) / cycles with
++	// >= 1 pending. Intel's Info_Memory_Latency_Load_L2_MLP.
++	MLP_MODE_L2 = 1,
++	MAX_MLP_MODES,
 +};
  // Which event feeds EVENT_LOAD samples. Independent of the range ranking, so
  // any ranking can be fed load-latency samples (upstream) or L3-miss ones (PACT).
@@ -324,7 +362,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
  
  extern ulong load_latency_sample_period;
  extern ulong load_latency_threshold;
-@@ -64,6 +94,11 @@
+@@ -64,6 +103,12 @@
  extern ulong split_period_ms;
  extern ulong rtree_split_thresh;
  extern ulong rtree_exch_thresh;
@@ -333,6 +371,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
 +extern ulong pac_alpha_pm;
 +extern ulong pac_recency_ticks;
 +extern ulong pac_window_ms;
++extern ulong mlp_mode;
  
  extern struct kmem_cache *list_head_cache;
  
@@ -490,7 +529,7 @@ diff -ruN a/mm/demeter/range_tree.h b/mm/demeter/range_tree.h
  			mrange_show(ins);
  		}
  		mrange_drop(curr);
-@@ -228,11 +299,93 @@
+@@ -228,11 +299,94 @@
  	return r->age + RTREE_COOL_AGE > self->age;
  }
  
@@ -504,7 +543,8 @@ diff -ruN a/mm/demeter/range_tree.h b/mm/demeter/range_tree.h
 +// (T1), busy = cycles with >= 1 pending (T2), MLP = occ / busy. Dividing by busy
 +// cycles, not the window length, is what keeps S tracking how much the slow
 +// tier is used (S = k * T2 / W by Little's Law); Little's Law over the whole
-+// window (MLP = lambda * W) collapses S to k * dt / W. The counters are not
++// window (MLP = lambda * W) collapses S to k * dt / W. mlp_mode picks the
++// counters (see enum mlp_mode_kind). The counters are not
 +// per-tier (the core does not know where a request is served), so this is the
 +// VM's global MLP. misses_slow are the window's slow-tier PEBS samples.
 +noinline static inline int rt_pac_tick(struct range_tree *self, u64 occ,

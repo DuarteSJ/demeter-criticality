@@ -43,6 +43,7 @@ def demeter(pid: int = -1):
         "pac_alpha_pm",
         "pac_recency_ticks",
         "pac_window_ms",
+        "mlp_mode",
     ]:
         exec(f"""if {modarg} := os.getenv("{modarg}", None):
             {modarg} = int({modarg})
