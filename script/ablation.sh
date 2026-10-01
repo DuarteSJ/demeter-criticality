@@ -7,6 +7,16 @@
 #   B      frequency ranking, L3-miss samples      (signal effect: B vs A)
 #   C      PAC ranking,       L3-miss samples      (metric effect: C vs B)
 #          (L2MLP, cooling alpha 0.9: the 2026-10-01 bc runs)
+# PAC with each MLP estimate (mlp_mode), L3-miss samples, PACT's alpha 1.0:
+#   P0     MLP = 1 (control: slow-tier sample counting, no MLP)
+#   P1     L2MLP
+#   P2     L3-miss MLP
+#   P3     window Little's Law over the whole VM, L3-miss occupancy / cycles
+#   P4     slow-tier Little's Law from load-latency PEBS (PACT's per-tier
+#          fallback; needs load_event 0, so its samples differ from P0-P3).
+#          Threshold 190 cycles (~64ns at 3GHz, the Demeter paper's intent;
+#          the register counts cycles, and upstream's 60 = ~20ns keeps L3
+#          hits), so its slow samples are slow-tier misses only.
 #   STATIC no Demeter, same DRAM ratio              (Linux first-touch placement)
 #   DRAM   no Demeter, all memory in DRAM           (upper bound)
 #   A_DRAM config A with all memory in DRAM         (Demeter overhead: vs DRAM)
@@ -78,6 +88,8 @@ run_one() { # config repeat
 	A) env='{"ranking_mode": 0, "load_event": 0, "rtree_exch_thresh": 8388608}' ;;
 	B) env='{"ranking_mode": 0, "load_event": 1, "rtree_exch_thresh": 8388608}' ;;
 	C) env='{"ranking_mode": 1, "load_event": 1, "rtree_exch_thresh": 8388608, "pac_alpha_pm": 900, "mlp_mode": 1}' ;;
+	P[0-3]) env='{"ranking_mode": 1, "load_event": 1, "rtree_exch_thresh": 8388608, "pac_alpha_pm": 1000, "mlp_mode": '"${cfg#P}"'}' ;;
+	P4) env='{"ranking_mode": 1, "load_event": 0, "rtree_exch_thresh": 8388608, "pac_alpha_pm": 1000, "mlp_mode": 4, "load_latency_threshold": 190}' ;;
 	STATIC) extra=(--launcher=env) ;;
 	DRAM) ratio=1.0 extra=(--launcher=env) ;;
 	A_DRAM | O_A) ratio=1.0 env='{"ranking_mode": 0, "load_event": 0}' ;;
