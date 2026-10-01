@@ -16,6 +16,12 @@ $(LLVM_TARBALL):
 		https://github.com/llvm/llvm-project/releases/download/llvmorg-$(LLVM_VERSION)/clang+llvm-$(LLVM_VERSION)-x86_64-linux-gnu-ubuntu-18.04.tar.xz
 llvm: $(LLVM_TARBALL) $(TOOLCHAIN_DIR)
 	tar -axf $< --strip-components=1 -C $(TOOLCHAIN_DIR)
+	# Ubuntu 26.04+ ships libxml2.so.16; the prebuilt ld.lld/clang need libxml2.so.2.
+	# Shim the old soname into toolchain/lib (on LD_LIBRARY_PATH); no-op where .so.2 exists.
+	@if [ ! -e $(TOOLCHAIN_DIR)/lib/libxml2.so.2 ] && [ -e /usr/lib/x86_64-linux-gnu/libxml2.so.16 ]; then \
+		ln -sf /usr/lib/x86_64-linux-gnu/libxml2.so.16 $(TOOLCHAIN_DIR)/lib/libxml2.so.2 ; \
+		echo "toolchain.mk: created libxml2.so.2 -> libxml2.so.16 shim (Ubuntu 26.04+)" ; \
+	fi
 
 MOLD_TARBALL := mold.tgz
 $(MOLD_TARBALL):

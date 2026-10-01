@@ -1,4 +1,5 @@
 include environment.mk
+SHELL := /bin/bash -O globstar
 KERNEL_TARGETS := olddefconfig bzImage modules compile_commands.json scripts_gdb
 DEMETER_KERNELS := demeter demeterhost
 SOTA_KERNELS := memtis nomad tpp tpphost
@@ -23,10 +24,17 @@ $(DEMETER_BASE_TARBALL):
 
 DEMETER_SOURCE_DIR := kernel/demeter
 demeter: $(DEMETER_SOURCE_DIR)/.stamp
-$(DEMETER_SOURCE_DIR)/.stamp: patch/demeter.patch $(DEMETER_BASE_TARBALL) $(DEMETER_SOURCE_DIR)
+$(DEMETER_SOURCE_DIR)/.stamp: patch/demeter.patch patch/spr-pebs.patch $(DEMETER_BASE_TARBALL) $(DEMETER_SOURCE_DIR)
+	@echo "Resetting source tree (files created by the patches are not in the tarball)..."
+	find $(DEMETER_SOURCE_DIR) -mindepth 1 -delete
 	tar -axf $(DEMETER_BASE_TARBALL) --strip-components=1 -C $(DEMETER_SOURCE_DIR)
 	@echo "Applying Demeter patch..."
 	patch -d $(DEMETER_SOURCE_DIR) -p1 < $<
+	@echo "Ubuntu 26.04 host-tool fix (glibc 2.41 const-correct strstr/strchr): exempt -Werror"
+	sed -i 's/override CFLAGS += -Werror -Wall/override CFLAGS += -Werror -Wall -Wno-error=incompatible-pointer-types-discards-qualifiers/' $(DEMETER_SOURCE_DIR)/tools/lib/bpf/Makefile
+	sed -i 's/CFLAGS += -Werror$$/CFLAGS += -Werror -Wno-error=incompatible-pointer-types-discards-qualifiers/' $(DEMETER_SOURCE_DIR)/tools/lib/subcmd/Makefile
+	@echo "Applying Sapphire/Emerald Rapids load-latency PEBS fixes (guest module + host KVM)..."
+	patch -d $(DEMETER_SOURCE_DIR) -p1 < patch/spr-pebs.patch
 	touch $@
 
 SOTA_BASE_TARBALL = sota-base.tar.gz
@@ -67,7 +75,8 @@ $(addprefix install-guest-,$(GUEST_KERNELS)): install-guest-%: build-%
 	cp -vt $(<:build-%=bin/%) \
 		$(<:build-%=build/%)/**/compressed/vmlinux.bin \
 		$(<:build-%=build/%)/**/*.ko \
-		$(<:build-%=build/%)/**/vmlinux
+		$(<:build-%=build/%)/vmlinux \
+		$(<:build-%=build/%)/System.map
 
 install-host: $(addprefix install-host-,$(HOST_KERNELS))
 

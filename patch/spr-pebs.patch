@@ -1,0 +1,46 @@
+--- a/mm/demeter/module.c	2026-09-29 17:22:32.882260629 +0100
++++ b/mm/demeter/module.c	2026-09-29 18:08:57.132764200 +0100
+@@ -74,7 +74,11 @@
+ 			       PERF_SAMPLE_WEIGHT | PERF_SAMPLE_PHYS_ADDR,
+ 		.sample_period = LOAD_LATENCY_SAMPLE_PERIOD ,
+ 		.inherit = 1,
+-		.precise_ip = 3,
++		// Sapphire/Emerald Rapids: precise_ip=3 (PDist) only exists on GP
++		// counter 0, which load latency cannot use, so the kernel rejects
++		// :ppp with EINVAL. precise_ip only affects the IP; the PEBS data
++		// address, latency and phys addr used here are exact at 2.
++		.precise_ip = 2,
+ 		// .disabled = 1,
+ 		.exclude_kernel = 1,
+ 		.exclude_hv = 1,
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -217,14 +217,25 @@
+ 		 * for MEM_TANS_RETIRED.LOAD_LATENCY_GT_*
+ 		 * see: x86_pmu_extra_regs() and intel_icl_extra_regs
+ 		 */
++		if (pmu->pebs_data_cfg & PEBS_DATACFG_MEMINFO)
++			attr.sample_type |= PERF_PEBS_MEMINFO_TYPE;
+ 		if (0x01cd == (attr.config & (ARCH_PERFMON_EVENTSEL_EVENT |
+ 					      ARCH_PERFMON_EVENTSEL_UMASK)) &&
+ 		    pmu->pebs_load_latency_threshold) {
+ 			attr.config1 = pmu->pebs_load_latency_threshold;
+-			attr.precise_ip = 3;
++			/*
++			 * Sapphire/Emerald Rapids: a load-latency event that
++			 * requests DATA_SRC must be grouped with the mem-loads-aux
++			 * event (else -ENODATA), and precise_ip=3 (PDist) exists
++			 * only on GP counter 0, which load latency cannot use
++			 * (else -EINVAL). Either way the backing host event is
++			 * never created and the guest counter never counts. The
++			 * guest-visible PEBS record is configured by the guest's
++			 * MSR_PEBS_DATA_CFG, so drop DATA_SRC here and keep the
++			 * precise level chosen above.
++			 */
++			attr.sample_type &= ~PERF_SAMPLE_DATA_SRC;
+ 		}
+-		if (pmu->pebs_data_cfg & PEBS_DATACFG_MEMINFO)
+-			attr.sample_type |= PERF_PEBS_MEMINFO_TYPE;
+ 	}
+ 
+ 	event = perf_event_create_kernel_counter(&attr, -1, current,
