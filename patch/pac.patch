@@ -244,7 +244,7 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
 +ulong mlp_mode = MLP_MODE_L2;
 +module_param_named(mlp_mode, mlp_mode, ulong, 0444);
 +MODULE_PARM_DESC(mlp_mode,
-+		 "PAC MLP estimate: 0=none (MLP=1), 1=L2MLP (default), 2=L3-miss MLP");
++		 "PAC MLP estimate: 0=none (MLP=1), 1=L2MLP (default), 2=L3-miss MLP, 3=window Little's Law (L3-miss occupancy/cycles)");
 +
  DEFINE_STATIC_KEY_TRUE(should_decay_sketch);
  struct kmem_cache *list_head_cache;
@@ -275,7 +275,7 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
  static inline void event_attrs_update_param(void)
  {
  	if (load_event == LOAD_EVENT_L3_MISS) {
-@@ -131,6 +178,16 @@
+@@ -131,6 +178,20 @@
  		event_attrs[EVENT_LOAD].config1 = load_latency_threshold;
  	}
  
@@ -284,6 +284,10 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
 +			OFFCORE_REQUESTS_OUTSTANDING_L3_MISS_DEMAND_DATA_RD;
 +		mlp_attrs[MLP_BUSY].config =
 +			OFFCORE_REQUESTS_OUTSTANDING_CYCLES_WITH_L3_MISS_DEMAND_DATA_RD;
++	} else if (mlp_mode == MLP_MODE_WINDOW) {
++		mlp_attrs[MLP_OCCUPANCY].config =
++			OFFCORE_REQUESTS_OUTSTANDING_L3_MISS_DEMAND_DATA_RD;
++		mlp_attrs[MLP_BUSY].config = CPU_CLK_UNHALTED_THREAD_P;
 +	}
 +	pr_info("%s: mlp_mode=%lu mlp_configs=%#llx/%#llx\n", __func__,
 +		mlp_mode, mlp_attrs[MLP_OCCUPANCY].config,
@@ -292,7 +296,7 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
  	// event_attrs[EVENT_LOAD].sample_period = load_l3_miss_sample_period;
  	event_attrs[EVENT_STORE].sample_period = retired_stores_sample_period;
  	pr_info("%s: load_event=%lu load_config=%#llx local_dram_miss_sample_period=%lu retired_stores_sample_period=%lu load_latency_sample_period=%lu load_latency_threshold=%lu\n",
-@@ -157,6 +214,11 @@
+@@ -157,6 +218,11 @@
  		pr_err("Failed to create list_head cache\n");
  		return -ENOMEM;
  	}
@@ -327,7 +331,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
  enum event_config {
  	MEM_TRANS_RETIRED_LOAD_LATENCY = 0x01cd,
  	MEM_INST_RETIRED_ALL_STORES = 0x82d0,
-@@ -40,19 +53,55 @@
+@@ -40,19 +53,61 @@
  	// the L3-miss load events; the tier is taken from the sample's physical
  	// address, so one supplier-agnostic event covers DRAM and CXL.
  	MEM_LOAD_RETIRED_L3_MISS = 0x20d1,
@@ -341,6 +345,8 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
 +	OFFCORE_REQUESTS_OUTSTANDING_L3_MISS_DEMAND_DATA_RD = 0x1020,
 +	OFFCORE_REQUESTS_OUTSTANDING_CYCLES_WITH_L3_MISS_DEMAND_DATA_RD =
 +		0x01001020,
++	// Unhalted core cycles (CPU_CLK_UNHALTED.THREAD_P).
++	CPU_CLK_UNHALTED_THREAD_P = 0x003c,
  };
  enum target_event {
  	EVENT_LOAD,
@@ -351,7 +357,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
 +// MLP = MLP_OCCUPANCY / MLP_BUSY, with the events chosen by mlp_mode.
 +enum mlp_counter {
 +	MLP_OCCUPANCY, // T1: sum over cycles of pending demand reads
-+	MLP_BUSY, // T2: cycles with >= 1 pending demand read
++	MLP_BUSY, // T2: cycles with >= 1 pending (mlp_mode 3: all cycles)
 +	MAX_MLP_COUNTERS,
 +};
 +// How PAC estimates the window's MLP in S = k * misses_slow / MLP. All are
@@ -365,6 +371,10 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
 +	MLP_MODE_L2 = 1,
 +	// Same ratio over L3-miss demand reads only (served by memory).
 +	MLP_MODE_L3_MISS = 2,
++	// PACT's fallback without TOR (Sec. 4.2.2): Little's Law over the whole
++	// window, MLP = bandwidth * latency = (N/cycles) * (T1/N) = T1/cycles,
++	// with T1 the L3-miss occupancy and cycles all unhalted cycles.
++	MLP_MODE_WINDOW = 3,
 +	MAX_MLP_MODES,
 +};
  // Which event feeds EVENT_LOAD samples. Independent of the range ranking, so
@@ -383,7 +393,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
  
  extern ulong load_latency_sample_period;
  extern ulong load_latency_threshold;
-@@ -64,6 +113,12 @@
+@@ -64,6 +119,12 @@
  extern ulong split_period_ms;
  extern ulong rtree_split_thresh;
  extern ulong rtree_exch_thresh;
@@ -550,7 +560,7 @@ diff -ruN a/mm/demeter/range_tree.h b/mm/demeter/range_tree.h
  			mrange_show(ins);
  		}
  		mrange_drop(curr);
-@@ -228,11 +299,94 @@
+@@ -228,11 +299,95 @@
  	return r->age + RTREE_COOL_AGE > self->age;
  }
  
@@ -564,8 +574,9 @@ diff -ruN a/mm/demeter/range_tree.h b/mm/demeter/range_tree.h
 +// (T1), busy = cycles with >= 1 pending (T2), MLP = occ / busy. Dividing by busy
 +// cycles, not the window length, is what keeps S tracking how much the slow
 +// tier is used (S = k * T2 / W by Little's Law); Little's Law over the whole
-+// window (MLP = lambda * W) collapses S to k * dt / W. mlp_mode picks the
-+// counters (see enum mlp_mode_kind); mode 0 passes occ = busy = 1. The counters are not
++// window (MLP = lambda * W, mlp_mode 3, kept as PACT's fallback for
++// comparison) collapses S to k * dt / W. mlp_mode picks the counters (see
++// enum mlp_mode_kind); mode 0 passes occ = busy = 1. The counters are not
 +// per-tier (the core does not know where a request is served), so this is the
 +// VM's global MLP. misses_slow are the window's slow-tier PEBS samples.
 +noinline static inline int rt_pac_tick(struct range_tree *self, u64 occ,
