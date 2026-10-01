@@ -244,7 +244,7 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
 +ulong mlp_mode = MLP_MODE_L2;
 +module_param_named(mlp_mode, mlp_mode, ulong, 0444);
 +MODULE_PARM_DESC(mlp_mode,
-+		 "PAC MLP estimate: 0=none (MLP=1), 1=L2MLP (default)");
++		 "PAC MLP estimate: 0=none (MLP=1), 1=L2MLP (default), 2=L3-miss MLP");
 +
  DEFINE_STATIC_KEY_TRUE(should_decay_sketch);
  struct kmem_cache *list_head_cache;
@@ -275,10 +275,16 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
  static inline void event_attrs_update_param(void)
  {
  	if (load_event == LOAD_EVENT_L3_MISS) {
-@@ -131,6 +178,10 @@
+@@ -131,6 +178,16 @@
  		event_attrs[EVENT_LOAD].config1 = load_latency_threshold;
  	}
  
++	if (mlp_mode == MLP_MODE_L3_MISS) {
++		mlp_attrs[MLP_OCCUPANCY].config =
++			OFFCORE_REQUESTS_OUTSTANDING_L3_MISS_DEMAND_DATA_RD;
++		mlp_attrs[MLP_BUSY].config =
++			OFFCORE_REQUESTS_OUTSTANDING_CYCLES_WITH_L3_MISS_DEMAND_DATA_RD;
++	}
 +	pr_info("%s: mlp_mode=%lu mlp_configs=%#llx/%#llx\n", __func__,
 +		mlp_mode, mlp_attrs[MLP_OCCUPANCY].config,
 +		mlp_attrs[MLP_BUSY].config);
@@ -286,7 +292,7 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
  	// event_attrs[EVENT_LOAD].sample_period = load_l3_miss_sample_period;
  	event_attrs[EVENT_STORE].sample_period = retired_stores_sample_period;
  	pr_info("%s: load_event=%lu load_config=%#llx local_dram_miss_sample_period=%lu retired_stores_sample_period=%lu load_latency_sample_period=%lu load_latency_threshold=%lu\n",
-@@ -157,6 +208,11 @@
+@@ -157,6 +214,11 @@
  		pr_err("Failed to create list_head cache\n");
  		return -ENOMEM;
  	}
@@ -321,7 +327,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
  enum event_config {
  	MEM_TRANS_RETIRED_LOAD_LATENCY = 0x01cd,
  	MEM_INST_RETIRED_ALL_STORES = 0x82d0,
-@@ -40,19 +53,48 @@
+@@ -40,19 +53,55 @@
  	// the L3-miss load events; the tier is taken from the sample's physical
  	// address, so one supplier-agnostic event covers DRAM and CXL.
  	MEM_LOAD_RETIRED_L3_MISS = 0x20d1,
@@ -330,6 +336,11 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
 +	// least one pending. Event 0x20 umask 0x01, cmask in config bits 24-31.
 +	OFFCORE_REQUESTS_OUTSTANDING_DEMAND_DATA_RD = 0x0120,
 +	OFFCORE_REQUESTS_OUTSTANDING_CYCLES_WITH_DEMAND_DATA_RD = 0x01000120,
++	// Same pair restricted to demand reads that missed L3 (served by
++	// memory, either tier): event 0x20 umask 0x10.
++	OFFCORE_REQUESTS_OUTSTANDING_L3_MISS_DEMAND_DATA_RD = 0x1020,
++	OFFCORE_REQUESTS_OUTSTANDING_CYCLES_WITH_L3_MISS_DEMAND_DATA_RD =
++		0x01001020,
  };
  enum target_event {
  	EVENT_LOAD,
@@ -352,6 +363,8 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
 +	// L2MLP: pending L2-miss demand reads (includes L3 hits) / cycles with
 +	// >= 1 pending. Intel's Info_Memory_Latency_Load_L2_MLP.
 +	MLP_MODE_L2 = 1,
++	// Same ratio over L3-miss demand reads only (served by memory).
++	MLP_MODE_L3_MISS = 2,
 +	MAX_MLP_MODES,
 +};
  // Which event feeds EVENT_LOAD samples. Independent of the range ranking, so
@@ -370,7 +383,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
  
  extern ulong load_latency_sample_period;
  extern ulong load_latency_threshold;
-@@ -64,6 +106,12 @@
+@@ -64,6 +113,12 @@
  extern ulong split_period_ms;
  extern ulong rtree_split_thresh;
  extern ulong rtree_exch_thresh;
