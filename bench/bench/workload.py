@@ -31,7 +31,7 @@ def gups_args(
             args += f"{workload} --{exponent=} "
             args += "--reverse " if reverse else ""
         case "random":
-            pass
+            args += f"{workload} "
         case _:
             raise ValueError(f"workload {workload} not supported")
     return args

@@ -30,7 +30,7 @@ bin/root.img: $(ROOT_IMG_PARTS)
 	cat $? | zstd -d -o $@
 
 $(ROOT_IMGS): bin/root.img
-	qemu-img create -f qcow2 -b $(notdir $<) -F qcow2 -o compression_type=zstd $@
+	qemu-img create -f qcow2 -b $(abspath $<) -F qcow2 -o compression_type=zstd $@
 
 bin/cloud-hypervisor: hypervisor/target/x86_64-unknown-linux-musl/release/cloud-hypervisor
 	mkdir -p $(dir $@)
