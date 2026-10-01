@@ -20,7 +20,7 @@ diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
  
  	atomic_long_t stats[MAX_STATS];
  	// Should only used by the new() and drop()
-@@ -291,7 +296,55 @@
+@@ -291,7 +296,59 @@
  	struct mrange **mrs; // mset > fmem + smem + tset
  	mpsc_t samplech, excg_req, excg_rsp, splt_req;
  	ulong (*node_avail_pages)(int);
@@ -70,14 +70,18 @@ diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
 +	now = ktime_get_ns();
 +	if (now - data->pac_last_tick_ns < pac_window_ms * NSEC_PER_MSEC)
 +		return;
-+	policy_read_mlp(data, &occ, &busy);
++	// mlp_mode 0: no counters, MLP = occ / busy = 1.
++	if (mlp_mode == MLP_MODE_NONE)
++		occ = busy = 1;
++	else
++		policy_read_mlp(data, &occ, &busy);
 +	rt_pac_tick(data->rt, occ, busy);
 +	data->pac_last_tick_ns = now;
 +}
  struct exch_req {
  	struct list_head *promotion, *demotion;
  };
-@@ -313,7 +366,35 @@
+@@ -313,7 +370,35 @@
  		return PEBS_NR_DISCARDED_IGNORE - PEBS_NR_DISCARDED;
  	if (mm->start_code <= vaddr && vaddr < max(mm->end_data, mm->start_brk))
  		return PEBS_NR_DISCARDED_IGNORE - PEBS_NR_DISCARDED;
@@ -114,7 +118,7 @@ diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
  	return 0;
  }
  noinline static int policy_handle_samples(struct policy_worker *data,
-@@ -394,15 +475,27 @@
+@@ -394,15 +479,27 @@
  		ulong total = r->in_smem;
  		ulong got = rt_isolate(mm, r, SMEM_NID, ULONG_MAX, manage_folio,
  				       promo);
@@ -142,7 +146,7 @@ diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
  		matched += got;
  	}
  
-@@ -411,9 +504,9 @@
+@@ -411,9 +508,9 @@
  		.promotion = promo,
  		.demotion = demo,
  	};
@@ -154,7 +158,7 @@ diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
  	if (mpsc_send(excg_req, &req, sizeof(req)) < 0) {
  		pr_err("%s: discard exchange request due to ring buffer overflow\n",
  		       __func__);
-@@ -555,6 +648,8 @@
+@@ -555,6 +652,8 @@
  		.excg_rsp = excg_rsp,
  		.splt_req = splt_req,
  		.node_avail_pages = fn,
@@ -163,7 +167,7 @@ diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
  	};
  
  	// reporting is rate limited to every 500ms
-@@ -608,6 +703,7 @@
+@@ -608,6 +707,7 @@
  			       ERR_PTR(which));
  			BUG();
  		}
@@ -171,7 +175,7 @@ diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
  
  		u64 curr_report =
  			max(sample_count, max(excg_req_count, excg_rsp_count));
-@@ -851,6 +947,11 @@
+@@ -851,6 +951,11 @@
  		// The worker must not exit before we stop it
  		kthread_stop(t);
  	}
@@ -183,15 +187,16 @@ diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
  	for (int i = 0; i < MAX_CHANS; i++) {
  		mpsc_t ch = self->chans[i];
  		!ch ?: mpsc_drop(ch);
-@@ -902,6 +1003,22 @@
+@@ -902,6 +1007,23 @@
  			__func__, event_attrs[i].config, event_attrs[i].config1,
  			event_attrs[i].sample_period);
  	}
-+	// PAC: MLP counters only in PAC mode, so the frequency baseline is
-+	// unchanged. Fail the attach if unavailable: PAC is meaningless without
-+	// them.
++	// PAC: MLP counters only in PAC mode with an MLP estimate, so the
++	// frequency baseline is unchanged. Fail the attach if unavailable: the
++	// chosen estimate is meaningless without them.
 +	BUILD_BUG_ON(ARRAY_SIZE(mlp_attrs) != MAX_MLP_COUNTERS);
-+	for (int i = 0; ranking_mode == RANKING_PAC && i < MAX_MLP_COUNTERS;
++	for (int i = 0; ranking_mode == RANKING_PAC &&
++			mlp_mode != MLP_MODE_NONE && i < MAX_MLP_COUNTERS;
 +	     i++) {
 +		struct perf_event *e = perf_event_create_kernel_counter(
 +			&mlp_attrs[i], -1, self->victim, NULL, NULL);
@@ -239,7 +244,7 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
 +ulong mlp_mode = MLP_MODE_L2;
 +module_param_named(mlp_mode, mlp_mode, ulong, 0444);
 +MODULE_PARM_DESC(mlp_mode,
-+		 "PAC MLP estimate: 1=L2MLP (default)");
++		 "PAC MLP estimate: 0=none (MLP=1), 1=L2MLP (default)");
 +
  DEFINE_STATIC_KEY_TRUE(should_decay_sketch);
  struct kmem_cache *list_head_cache;
@@ -285,7 +290,7 @@ diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
  		pr_err("Failed to create list_head cache\n");
  		return -ENOMEM;
  	}
-+	if (mlp_mode < MLP_MODE_L2 || mlp_mode >= MAX_MLP_MODES) {
++	if (mlp_mode >= MAX_MLP_MODES) {
 +		pr_err("invalid mlp_mode=%lu\n", mlp_mode);
 +		kmem_cache_destroy(list_head_cache);
 +		return -EINVAL;
@@ -316,7 +321,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
  enum event_config {
  	MEM_TRANS_RETIRED_LOAD_LATENCY = 0x01cd,
  	MEM_INST_RETIRED_ALL_STORES = 0x82d0,
-@@ -40,19 +53,45 @@
+@@ -40,19 +53,48 @@
  	// the L3-miss load events; the tier is taken from the sample's physical
  	// address, so one supplier-agnostic event covers DRAM and CXL.
  	MEM_LOAD_RETIRED_L3_MISS = 0x20d1,
@@ -341,6 +346,9 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
 +// How PAC estimates the window's MLP in S = k * misses_slow / MLP. All are
 +// per VM and per window (no core counter is per tier).
 +enum mlp_mode_kind {
++	// MLP = 1: no counters, S = k * misses_slow. Control that isolates
++	// what the MLP estimate adds over slow-tier sample counting.
++	MLP_MODE_NONE = 0,
 +	// L2MLP: pending L2-miss demand reads (includes L3 hits) / cycles with
 +	// >= 1 pending. Intel's Info_Memory_Latency_Load_L2_MLP.
 +	MLP_MODE_L2 = 1,
@@ -362,7 +370,7 @@ diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
  
  extern ulong load_latency_sample_period;
  extern ulong load_latency_threshold;
-@@ -64,6 +103,12 @@
+@@ -64,6 +106,12 @@
  extern ulong split_period_ms;
  extern ulong rtree_split_thresh;
  extern ulong rtree_exch_thresh;
@@ -544,7 +552,7 @@ diff -ruN a/mm/demeter/range_tree.h b/mm/demeter/range_tree.h
 +// cycles, not the window length, is what keeps S tracking how much the slow
 +// tier is used (S = k * T2 / W by Little's Law); Little's Law over the whole
 +// window (MLP = lambda * W) collapses S to k * dt / W. mlp_mode picks the
-+// counters (see enum mlp_mode_kind). The counters are not
++// counters (see enum mlp_mode_kind); mode 0 passes occ = busy = 1. The counters are not
 +// per-tier (the core does not know where a request is served), so this is the
 +// VM's global MLP. misses_slow are the window's slow-tier PEBS samples.
 +noinline static inline int rt_pac_tick(struct range_tree *self, u64 occ,
