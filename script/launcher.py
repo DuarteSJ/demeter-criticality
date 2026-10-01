@@ -38,6 +38,11 @@ def demeter(pid: int = -1):
         "rtree_split_thresh",
         "rtree_exch_thresh",
         "load_event",
+        "ranking_mode",
+        "pac_k",
+        "pac_alpha_pm",
+        "pac_recency_ticks",
+        "pac_window_ms",
     ]:
         exec(f"""if {modarg} := os.getenv("{modarg}", None):
             {modarg} = int({modarg})

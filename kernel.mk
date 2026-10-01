@@ -24,7 +24,7 @@ $(DEMETER_BASE_TARBALL):
 
 DEMETER_SOURCE_DIR := kernel/demeter
 demeter: $(DEMETER_SOURCE_DIR)/.stamp
-$(DEMETER_SOURCE_DIR)/.stamp: patch/demeter.patch patch/spr-pebs.patch patch/load-event.patch $(DEMETER_BASE_TARBALL) $(DEMETER_SOURCE_DIR)
+$(DEMETER_SOURCE_DIR)/.stamp: patch/demeter.patch patch/spr-pebs.patch patch/load-event.patch patch/pac.patch $(DEMETER_BASE_TARBALL) $(DEMETER_SOURCE_DIR)
 	@echo "Resetting source tree (files created by the patches are not in the tarball)..."
 	find $(DEMETER_SOURCE_DIR) -mindepth 1 -delete
 	tar -axf $(DEMETER_BASE_TARBALL) --strip-components=1 -C $(DEMETER_SOURCE_DIR)
@@ -37,6 +37,8 @@ $(DEMETER_SOURCE_DIR)/.stamp: patch/demeter.patch patch/spr-pebs.patch patch/loa
 	patch -d $(DEMETER_SOURCE_DIR) -p1 < patch/spr-pebs.patch
 	@echo "Applying load_event switch (L3-miss load sampling)..."
 	patch -d $(DEMETER_SOURCE_DIR) -p1 < patch/load-event.patch
+	@echo "Applying PAC criticality metric patch..."
+	patch -d $(DEMETER_SOURCE_DIR) -p1 < patch/pac.patch
 	touch $@
 
 SOTA_BASE_TARBALL = sota-base.tar.gz

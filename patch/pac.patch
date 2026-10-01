@@ -1,0 +1,586 @@
+diff -ruN a/mm/demeter/core.c b/mm/demeter/core.c
+--- a/mm/demeter/core.c
++++ b/mm/demeter/core.c
+@@ -11,6 +11,7 @@
+ #include <linux/mm.h>
+ #include <linux/mm_inline.h>
+ #include <linux/sort.h>
++#include <linux/timekeeping.h>
+ #include <../internal.h>
+ 
+ #include "error.h"
+@@ -89,6 +90,10 @@
+ 	struct task_struct *workers[MAX_WORKERS];
+ 	// Should only be used by the throttle and main thread
+ 	struct perf_event *events[MAX_EVENTS];
++	// PAC: MLP counting events (PAC mode only), read by the policy worker.
++	// Not throttled with the PEBS events: counting has no PMI cost and the
++	// ratio T1/T2 needs full-window coverage.
++	struct perf_event *mlp_events[MAX_MLP_COUNTERS];
+ 
+ 	atomic_long_t stats[MAX_STATS];
+ 	// Should only used by the new() and drop()
+@@ -291,7 +296,55 @@
+ 	struct mrange **mrs; // mset > fmem + smem + tset
+ 	mpsc_t samplech, excg_req, excg_rsp, splt_req;
+ 	ulong (*node_avail_pages)(int);
+-};
++	// PAC: MLP counting events and their last read values (for deltas).
++	struct perf_event **mlp_events;
++	u64 mlp_prev[MAX_MLP_COUNTERS];
++	// PAC: start of the current attribution window (ns).
++	u64 pac_last_tick_ns;
++};
++// PAC: read this window's MLP counter deltas. Returns false if the counters
++// are absent (frequency mode), leaving occ/busy zero.
++static bool policy_read_mlp(struct policy_worker *data, u64 *occ, u64 *busy)
++{
++	u64 delta[MAX_MLP_COUNTERS] = {};
++	for (int i = 0; i < MAX_MLP_COUNTERS; i++) {
++		// Workers start before target_new creates the counters.
++		struct perf_event *e = READ_ONCE(data->mlp_events[i]);
++		u64 enabled, running;
++		if (!e)
++			return false;
++		// Sums the inherited per-thread child events.
++		u64 val = perf_event_read_value(e, &enabled, &running);
++		if (running < enabled)
++			pr_info_ratelimited(
++				"%s: mlp counter %d multiplexed running=%llu enabled=%llu\n",
++				__func__, i, running, enabled);
++		delta[i] = val - data->mlp_prev[i];
++		data->mlp_prev[i] = val;
++	}
++	*occ = delta[MLP_OCCUPANCY];
++	*busy = delta[MLP_BUSY];
++	return true;
++}
++// PAC: close the attribution window once pac_window_ms has elapsed. Driven
++// from the policy loop, not the exchange path: Demeter exchanges only after a
++// split changes the range tree, which can stop for the rest of a run, while
++// PAC needs a steady clock (PACT: 20ms windows, MLP stable within tens of ms).
++// Samples stream continuously (throttling off by default), so the loop wakes
++// often; if the victim idles, the window stretches and the counter deltas
++// cover the same stretched span.
++static void policy_maybe_pac_tick(struct policy_worker *data)
++{
++	u64 now, occ = 0, busy = 0;
++	if (ranking_mode != RANKING_PAC)
++		return;
++	now = ktime_get_ns();
++	if (now - data->pac_last_tick_ns < pac_window_ms * NSEC_PER_MSEC)
++		return;
++	policy_read_mlp(data, &occ, &busy);
++	rt_pac_tick(data->rt, occ, busy);
++	data->pac_last_tick_ns = now;
++}
+ struct exch_req {
+ 	struct list_head *promotion, *demotion;
+ };
+@@ -313,7 +366,35 @@
+ 		return PEBS_NR_DISCARDED_IGNORE - PEBS_NR_DISCARDED;
+ 	if (mm->start_code <= vaddr && vaddr < max(mm->end_data, mm->start_brk))
+ 		return PEBS_NR_DISCARDED_IGNORE - PEBS_NR_DISCARDED;
+-	TRY(rt_count(rt, vaddr));
++	// PAC: only classify tier and read latency in PAC mode, so the frequency
++	// baseline pays zero overhead (no per-sample page lookup). Slow = a sample
++	// of the active load event (load latency or L3 miss, see load_event) on
++	// the slow node; store samples never count. Latency (weight) is only
++	// meaningful for the load-latency event and is used for logging only.
++	bool is_slow = false;
++	u64 w = 0;
++	if (ranking_mode == RANKING_PAC) {
++		bool is_load = s->config == event_attrs[EVENT_LOAD].config;
++		struct page *pg =
++			s->phys_addr ?
++				pfn_to_online_page(PHYS_PFN(s->phys_addr)) :
++				NULL;
++		int nid = pg ? page_to_nid(pg) : NUMA_NO_NODE;
++		is_slow = is_load && nid == SMEM_NID;
++		w = s->config == MEM_TRANS_RETIRED_LOAD_LATENCY ? s->weight : 0;
++		// Diagnostic: record why a sample was or was not slow.
++		enum pac_cls c =
++			!is_load				   ? PAC_CLS_STORE :
++			!s->phys_addr				   ? PAC_CLS_NOPHYS :
++			!pg					   ? PAC_CLS_NOPAGE :
++			nid == FMEM_NID				   ? PAC_CLS_FAST :
++			nid == SMEM_NID				   ? PAC_CLS_SLOW :
++								     PAC_CLS_OTHER;
++		rt->win_cls[c] += 1;
++		if (c == PAC_CLS_OTHER)
++			rt->last_other_nid = nid;
++	}
++	TRY(rt_count(rt, vaddr, w, is_slow));
+ 	return 0;
+ }
+ noinline static int policy_handle_samples(struct policy_worker *data,
+@@ -394,15 +475,27 @@
+ 		ulong total = r->in_smem;
+ 		ulong got = rt_isolate(mm, r, SMEM_NID, ULONG_MAX, manage_folio,
+ 				       promo);
++		// PAC: count repromotions of ranges demoted within the recent
++		// window (ping-pong observability).
++		if (ranking_mode == RANKING_PAC && got && r->demoted_tick &&
++		    rt->tick - r->demoted_tick <= PAC_REPROMO_WINDOW)
++			rt->repromotions += 1;
+ 		candidates += got;
+ 	}
+ 	// isolate demotion candidate to match the promotion
+ 	ulong matched = 0;
+ 	for (ulong i = 0; matched < candidates && i < f; i++) {
+ 		struct mrange *r = mrs[i];
++		// PAC: recency guard, keep recently-used ranges resident in the
++		// fast tier even if their decayed pac ranks them low this window.
++		if (ranking_mode == RANKING_PAC && r->last_touch_tick &&
++		    r->last_touch_tick + pac_recency_ticks > rt->tick)
++			continue;
+ 		ulong total = r->in_fmem;
+ 		ulong got = rt_isolate(mm, r, FMEM_NID, candidates - matched,
+ 				       manage_folio, demo);
++		if (ranking_mode == RANKING_PAC && got)
++			r->demoted_tick = rt->tick;
+ 		matched += got;
+ 	}
+ 
+@@ -411,9 +504,9 @@
+ 		.promotion = promo,
+ 		.demotion = demo,
+ 	};
+-	pr_info("%s: exchange request sent promotion=%luM demotion=%luM\n",
++	pr_info("%s: exchange request sent promotion=%luM demotion=%luM repromotions=%llu\n",
+ 		__func__, candidates << PAGE_SHIFT >> 20,
+-		matched << PAGE_SHIFT >> 20);
++		matched << PAGE_SHIFT >> 20, rt->repromotions);
+ 	if (mpsc_send(excg_req, &req, sizeof(req)) < 0) {
+ 		pr_err("%s: discard exchange request due to ring buffer overflow\n",
+ 		       __func__);
+@@ -555,6 +648,8 @@
+ 		.excg_rsp = excg_rsp,
+ 		.splt_req = splt_req,
+ 		.node_avail_pages = fn,
++		.mlp_events = self->mlp_events,
++		.pac_last_tick_ns = ktime_get_ns(),
+ 	};
+ 
+ 	// reporting is rate limited to every 500ms
+@@ -608,6 +703,7 @@
+ 			       ERR_PTR(which));
+ 			BUG();
+ 		}
++		policy_maybe_pac_tick(&data);
+ 
+ 		u64 curr_report =
+ 			max(sample_count, max(excg_req_count, excg_rsp_count));
+@@ -851,6 +947,11 @@
+ 		// The worker must not exit before we stop it
+ 		kthread_stop(t);
+ 	}
++	// PAC: release the MLP counters once the policy worker has stopped.
++	for (int i = 0; i < MAX_MLP_COUNTERS; i++) {
++		if (self->mlp_events[i])
++			perf_event_release_kernel(self->mlp_events[i]);
++	}
+ 	for (int i = 0; i < MAX_CHANS; i++) {
+ 		mpsc_t ch = self->chans[i];
+ 		!ch ?: mpsc_drop(ch);
+@@ -902,6 +1003,22 @@
+ 			__func__, event_attrs[i].config, event_attrs[i].config1,
+ 			event_attrs[i].sample_period);
+ 	}
++	// PAC: MLP counters only in PAC mode, so the frequency baseline is
++	// unchanged. Fail the attach if unavailable: PAC is meaningless without
++	// them.
++	BUILD_BUG_ON(ARRAY_SIZE(mlp_attrs) != MAX_MLP_COUNTERS);
++	for (int i = 0; ranking_mode == RANKING_PAC && i < MAX_MLP_COUNTERS;
++	     i++) {
++		struct perf_event *e = perf_event_create_kernel_counter(
++			&mlp_attrs[i], -1, self->victim, NULL, NULL);
++		if (IS_ERR_OR_NULL(e)) {
++			target_drop(self);
++			return ERR_CAST(e);
++		}
++		WRITE_ONCE(self->mlp_events[i], e);
++		pr_info("%s: created mlp counter config=%#llx\n", __func__,
++			mlp_attrs[i].config);
++	}
+ 	BUILD_BUG_ON(ARRAY_SIZE(target_stat_name) != MAX_STATS);
+ 	self->start_time = sched_clock();
+ 	return self;
+diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
+--- a/mm/demeter/module.c
++++ b/mm/demeter/module.c
+@@ -57,6 +57,29 @@
+ MODULE_PARM_DESC(load_event,
+ 		 "Load sample event: 0=load latency (default), 1=L3 miss retired (sample period: load_l3_miss_sample_period)");
+ 
++ulong ranking_mode = RANKING_FREQ;
++module_param_named(ranking_mode, ranking_mode, ulong, 0644);
++MODULE_PARM_DESC(ranking_mode,
++		 "Range ranking: 0=frequency (default), 1=PAC slow-tier criticality");
++
++ulong pac_k = PAC_K;
++module_param_named(pac_k, pac_k, ulong, 0644);
++MODULE_PARM_DESC(pac_k, "PAC tier constant k in S=k*misses/MLP, defaults to 1");
++
++ulong pac_alpha_pm = PAC_ALPHA_PERMILLE;
++module_param_named(pac_alpha_pm, pac_alpha_pm, ulong, 0644);
++MODULE_PARM_DESC(pac_alpha_pm, "PAC cooling alpha in permille (1000 = no cooling, PACT default)");
++
++ulong pac_recency_ticks = PAC_RECENCY_TICKS;
++module_param_named(pac_recency_ticks, pac_recency_ticks, ulong, 0644);
++MODULE_PARM_DESC(pac_recency_ticks,
++		 "Keep ranges touched within this many ticks in fast tier");
++
++ulong pac_window_ms = PAC_WINDOW_MS;
++module_param_named(pac_window_ms, pac_window_ms, ulong, 0644);
++MODULE_PARM_DESC(pac_window_ms,
++		 "PAC attribution window (tick period) in ms, defaults to 20");
++
+ DEFINE_STATIC_KEY_TRUE(should_decay_sketch);
+ struct kmem_cache *list_head_cache;
+ 
+@@ -116,6 +139,24 @@
+ 		.exclude_callchain_kernel = 1,
+ 	},
+ };
++// PAC: counting events for MLP = T1/T2, attached per task like event_attrs
++// (inherit covers the victim's threads). User-only to match the PEBS samples.
++struct perf_event_attr mlp_attrs[MAX_MLP_COUNTERS] = {
++	[MLP_OCCUPANCY] = {
++		.type = PERF_TYPE_RAW,
++		.config = OFFCORE_REQUESTS_OUTSTANDING_DEMAND_DATA_RD,
++		.inherit = 1,
++		.exclude_kernel = 1,
++		.exclude_hv = 1,
++	},
++	[MLP_BUSY] = {
++		.type = PERF_TYPE_RAW,
++		.config = OFFCORE_REQUESTS_OUTSTANDING_CYCLES_WITH_DEMAND_DATA_RD,
++		.inherit = 1,
++		.exclude_kernel = 1,
++		.exclude_hv = 1,
++	},
++};
+ static inline void event_attrs_update_param(void)
+ {
+ 	if (load_event == LOAD_EVENT_L3_MISS) {
+diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
+--- a/mm/demeter/module.h
++++ b/mm/demeter/module.h
+@@ -32,6 +32,19 @@
+ 	RTREE_MAX_SIZE = 2048,
+ 	RTREE_COOL_AGE = 3,
+ };
++enum pac_param_defaults {
++	PAC_K = 1,
++	// Cooling alpha in permille: pac = alpha*pac + S_r. PACT default
++	// (Sec. 4.3.4, Fig. 10c): 1.0, no cooling.
++	PAC_ALPHA_PERMILLE = 1000,
++	// Keep ranges touched within this many ticks resident in fast tier.
++	PAC_RECENCY_TICKS = 2,
++	// Repromotion within this many ticks of demotion counts as ping-pong.
++	PAC_REPROMO_WINDOW = 8,
++	// Attribution window length. PACT default: 20ms (MLP stable within tens
++	// of ms; perf imprecise below ~10ms; >=100s of ms dilutes PAC).
++	PAC_WINDOW_MS = 20,
++};
+ enum event_config {
+ 	MEM_TRANS_RETIRED_LOAD_LATENCY = 0x01cd,
+ 	MEM_INST_RETIRED_ALL_STORES = 0x82d0,
+@@ -40,19 +53,36 @@
+ 	// the L3-miss load events; the tier is taken from the sample's physical
+ 	// address, so one supplier-agnostic event covers DRAM and CXL.
+ 	MEM_LOAD_RETIRED_L3_MISS = 0x20d1,
++	// PAC MLP (core-side analogue of PACT's TOR T1/T2): per-cycle sum of
++	// pending demand data reads beyond L2, and (cmask=1) the cycles with at
++	// least one pending. Event 0x20 umask 0x01, cmask in config bits 24-31.
++	OFFCORE_REQUESTS_OUTSTANDING_DEMAND_DATA_RD = 0x0120,
++	OFFCORE_REQUESTS_OUTSTANDING_CYCLES_WITH_DEMAND_DATA_RD = 0x01000120,
+ };
+ enum target_event {
+ 	EVENT_LOAD,
+ 	EVENT_STORE,
+ 	MAX_EVENTS,
+ };
++// PAC: counting (non-sampling) events for the per-window MLP estimate.
++enum mlp_counter {
++	MLP_OCCUPANCY, // T1: sum over cycles of pending demand reads
++	MLP_BUSY, // T2: cycles with >= 1 pending demand read
++	MAX_MLP_COUNTERS,
++};
+ // Which event feeds EVENT_LOAD samples. Independent of the range ranking, so
+ // any ranking can be fed load-latency samples (upstream) or L3-miss ones (PACT).
+ enum load_event_kind {
+ 	LOAD_EVENT_LATENCY = 0, // MEM_TRANS_RETIRED.LOAD_LATENCY (upstream)
+ 	LOAD_EVENT_L3_MISS = 1, // MEM_LOAD_RETIRED.L3_MISS (PACT)
+ };
++enum ranking_mode_kind {
++	RANKING_FREQ = 0,
++	RANKING_PAC = 1,
++};
++
+ extern struct perf_event_attr event_attrs[MAX_EVENTS];
++extern struct perf_event_attr mlp_attrs[MAX_MLP_COUNTERS];
+ 
+ extern ulong load_latency_sample_period;
+ extern ulong load_latency_threshold;
+@@ -64,6 +94,11 @@
+ extern ulong split_period_ms;
+ extern ulong rtree_split_thresh;
+ extern ulong rtree_exch_thresh;
++extern ulong ranking_mode;
++extern ulong pac_k;
++extern ulong pac_alpha_pm;
++extern ulong pac_recency_ticks;
++extern ulong pac_window_ms;
+ 
+ extern struct kmem_cache *list_head_cache;
+ 
+diff -ruN a/mm/demeter/range_tree.h b/mm/demeter/range_tree.h
+--- a/mm/demeter/range_tree.h
++++ b/mm/demeter/range_tree.h
+@@ -4,6 +4,7 @@
+ #include <linux/mm.h>
+ #include <linux/maple_tree.h>
+ #include <linux/sort.h>
++#include <linux/math64.h>
+ 
+ #include "module.h"
+ #include "error.h"
+@@ -13,6 +14,12 @@
+ 	// We record the access count, but we rank them based on the frequency
+ 	ulong age, nr_access;
+ 	ulong in_fmem, in_smem;
++	// PAC: per-window slow-tier access count (reset each tick) and the cooled
++	// per-range criticality accumulator pac (the ranking key in PAC mode).
++	u64 win_slow_access, pac;
++	// PAC: last tick this range was accessed (+1, 0 = never), and the tick it
++	// was last demoted, for the demotion recency guard and repromotion counter.
++	u64 last_touch_tick, demoted_tick;
+ };
+ 
+ noinline static inline struct mrange *mrange_new(ulong start, ulong end,
+@@ -40,6 +47,15 @@
+ 	return r->nr_access * RTREE_GRANULARITY / (r->end - r->start + 1);
+ }
+ 
++// Size-normalized criticality density, mirroring mrange_freq. 128-bit
++// intermediate, so any accumulated pac is safe; ranges are at least
++// RTREE_GRANULARITY long, so the result never exceeds pac.
++static inline u64 mrange_pac(struct mrange const *r)
++{
++	return mul_u64_u64_div_u64(r->pac, RTREE_GRANULARITY,
++				   r->end - r->start + 1);
++}
++
+ static inline void mrange_show(struct mrange const *r)
+ {
+ 	static char const *units[] = {
+@@ -49,12 +65,23 @@
+ 	while (len < (unit = 1ul << (--ui * 10))) {
+ 	}
+ 
+-	pr_info("%s: managed range [%#lx, %#lx) len=%lu.%03lu%s freq=%lu age=%lu nr_access=%lu in_fmem=%lu in_smem=%lu\n",
++	pr_info("%s: managed range [%#lx, %#lx) len=%lu.%03lu%s freq=%lu age=%lu nr_access=%lu in_fmem=%lu in_smem=%lu pac=%llu win_slow=%llu\n",
+ 		__func__, r->start, r->end, len / unit,
+ 		(len % unit) * 1000 / unit, units[ui], mrange_freq(r), r->age,
+-		r->nr_access, r->in_fmem, r->in_smem);
++		r->nr_access, r->in_fmem, r->in_smem, r->pac, r->win_slow_access);
+ }
+ 
++// PAC: outcome of classifying one sample's tier (diagnostic counters).
++enum pac_cls {
++	PAC_CLS_STORE, // store-event sample, never slow by definition
++	PAC_CLS_NOPHYS, // load sample without a physical address
++	PAC_CLS_NOPAGE, // phys addr not backed by an online page
++	PAC_CLS_FAST, // on FMEM_NID
++	PAC_CLS_SLOW, // on SMEM_NID
++	PAC_CLS_OTHER, // on some other node (see last_other_nid)
++	PAC_CLS_MAX,
++};
++
+ // In theory the maximum range we need to cover is 128TiB under 48bit virtual
+ // address. But in practice we only need to cover [start_brk, mmap_base).
+ // An example is: [0x555558200000, 0x7f34ab400000) ~43TiB. We assume 64TiB, so
+@@ -67,6 +94,18 @@
+ 	// We index into the segment tree using the index off the start address
+ 	// with a granularity of SEG_TREE_GRANULARITY
+ 	ulong len, age, min_range;
++	// PAC per-window accumulators: total slow-tier accesses and summed slow
++	// latency this window (latency is logged only, S uses the MLP counters).
++	u64 win_total_slow_access, win_slow_lat_sum;
++	// PAC: all samples this window (fast + slow), for the tick log only.
++	u64 win_total_access;
++	// PAC: per-window tier classification outcomes (enum pac_cls) and the
++	// node of the last PAC_CLS_OTHER sample, for the tick log only.
++	u64 win_cls[PAC_CLS_MAX];
++	int last_other_nid;
++	// PAC: logical window counter (recency clock) and count of ranges
++	// repromoted within PAC_REPROMO_WINDOW ticks of demotion (ping-pong).
++	u64 tick, repromotions;
+ 	// Use the maple_tree as a sparse array
+ 	struct maple_tree tree;
+ };
+@@ -81,6 +120,13 @@
+ 	self->len = 1;
+ 	self->age = 0;
+ 	self->min_range = end - start;
++	self->win_total_slow_access = 0;
++	self->win_slow_lat_sum = 0;
++	self->win_total_access = 0;
++	memset(self->win_cls, 0, sizeof(self->win_cls));
++	self->last_other_nid = NUMA_NO_NODE;
++	self->tick = 0;
++	self->repromotions = 0;
+ 	mt_init(&self->tree);
+ 	UNWRAP(mtree_insert_range(&self->tree, start, end - 1,
+ 				  UNWRAP(mrange_new(start, end, self->age, 0)),
+@@ -112,7 +158,8 @@
+ 	}
+ }
+ 
+-noinline static inline int rt_count(struct range_tree *self, ulong addr)
++noinline static inline int rt_count(struct range_tree *self, ulong addr,
++				    u64 weight, bool is_slow)
+ {
+ 	ulong start = addr;
+ 	struct mrange *r = mt_find(&self->tree, &start, ULONG_MAX);
+@@ -122,6 +169,20 @@
+ 		return PEBS_NR_DISCARDED_ERROR - PEBS_NR_DISCARDED;
+ 	}
+ 	r->nr_access += 1;
++	// PAC: stamp recency on any access (PAC mode only) for the demotion
++	// recency guard; keeps the frequency path zero-overhead. Stored as
++	// tick + 1 so that 0 means never touched (not "touched at tick 0").
++	if (ranking_mode == RANKING_PAC) {
++		r->last_touch_tick = self->tick + 1;
++		self->win_total_access += 1;
++	}
++	// PAC: tally this window's slow-tier accesses (per range and global) and
++	// the global slow latency sum, consumed by rt_pac_tick to attribute stall.
++	if (is_slow) {
++		r->win_slow_access += 1;
++		self->win_total_slow_access += 1;
++		self->win_slow_lat_sum += weight;
++	}
+ 	return 0;
+ }
+ 
+@@ -200,6 +261,12 @@
+ 		}
+ 		struct mrange *ins = NULL;
+ 		ulong min_range = ULONG_MAX;
++		// PAC: split the parent's window count and criticality evenly.
++		// win_slow_access can be nonzero here because rt_split runs in a
++		// different policy-worker case than rt_pac_tick, so dividing it
++		// across the children is intentional (not dead code).
++		u64 child_win_slow = curr->win_slow_access / RTREE_SPLIT_N;
++		u64 child_pac = curr->pac / RTREE_SPLIT_N;
+ 		for (ulong i = 0, nr_access = curr->nr_access / RTREE_SPLIT_N;
+ 		     i < RTREE_SPLIT_N; ++i) {
+ 			pr_info("%s: inserting range [%#lx, %#lx)\n", __func__,
+@@ -210,6 +277,10 @@
+ 				ins = UNWRAP(mrange_new(edges[i], edges[i + 1],
+ 							self->age, nr_access)),
+ 				GFP_KERNEL));
++			ins->win_slow_access = child_win_slow;
++			ins->pac = child_pac;
++			ins->last_touch_tick = curr->last_touch_tick;
++			ins->demoted_tick = curr->demoted_tick;
+ 			mrange_show(ins);
+ 		}
+ 		mrange_drop(curr);
+@@ -228,11 +299,93 @@
+ 	return r->age + RTREE_COOL_AGE > self->age;
+ }
+ 
++// Fixed-point scale for S so per-range shares S * A_r / A_t keep resolution
++// when S is small. pac is only compared, so the scale is arbitrary.
++#define PAC_S_SCALE (1ull << 20)
++
++// PAC per-window tick (PACT Eq.1: S = k * misses_slow / MLP). Called every
++// pac_window_ms from the policy loop (policy_maybe_pac_tick). MLP comes from core counters, the core-side
++// analogue of PACT's TOR T1/T2: occ = per-cycle sum of pending demand reads
++// (T1), busy = cycles with >= 1 pending (T2), MLP = occ / busy. Dividing by busy
++// cycles, not the window length, is what keeps S tracking how much the slow
++// tier is used (S = k * T2 / W by Little's Law); Little's Law over the whole
++// window (MLP = lambda * W) collapses S to k * dt / W. The counters are not
++// per-tier (the core does not know where a request is served), so this is the
++// VM's global MLP. misses_slow are the window's slow-tier PEBS samples.
++noinline static inline int rt_pac_tick(struct range_tree *self, u64 occ,
++				       u64 busy)
++{
++	// One window summary per second, printed whether or not stall was
++	// attributed, so a zero sample count or MLP delta is visible.
++	static unsigned long next_log;
++	struct mrange *r;
++	ulong start = 0;
++	u64 S = 0;
++	// PAC: advance the logical recency clock once per window, before this
++	// window's last_touch stamps are compared against it at demotion time.
++	self->tick += 1;
++	if (self->win_total_slow_access && occ && busy) {
++		u64 total = self->win_total_slow_access;
++		// S = k * misses * busy / occ. busy <= occ (each busy cycle adds
++		// >= 1 to occ), so the result fits whenever the first factor does.
++		S = mul_u64_u64_div_u64(pac_k * total * PAC_S_SCALE, busy, occ);
++		// Single pass: attribute stall, cool, and reset the window count.
++		mt_for_each(&self->tree, r, start, ULONG_MAX) {
++			u64 s_r = mul_u64_u64_div_u64(S, r->win_slow_access,
++						      total);
++			r->pac = mul_u64_u64_div_u64(r->pac, pac_alpha_pm, 1000) + s_r;
++			r->win_slow_access = 0;
++		}
++	} else {
++		// No slow accesses (or no MLP sample) this window: cool scores and
++		// reset in one pass.
++		mt_for_each(&self->tree, r, start, ULONG_MAX) {
++			r->pac = mul_u64_u64_div_u64(r->pac, pac_alpha_pm, 1000);
++			r->win_slow_access = 0;
++		}
++	}
++	if (time_after_eq(jiffies, next_log)) {
++		next_log = jiffies + HZ;
++		pr_info("%s: tick=%llu samples=%llu slow=%llu W=%llu occ=%llu busy=%llu mlp_x1000=%llu S=%llu\n",
++			__func__, self->tick, self->win_total_access,
++			self->win_total_slow_access,
++			self->win_total_slow_access ?
++				div64_u64(self->win_slow_lat_sum,
++					  self->win_total_slow_access) :
++				0,
++			occ, busy,
++			busy ? mul_u64_u64_div_u64(occ, 1000, busy) : 0, S);
++		pr_info("%s: cls store=%llu nophys=%llu nopage=%llu fast=%llu slow=%llu other=%llu last_other_nid=%d fmem_nid=%d smem_nid=%d\n",
++			__func__, self->win_cls[PAC_CLS_STORE],
++			self->win_cls[PAC_CLS_NOPHYS],
++			self->win_cls[PAC_CLS_NOPAGE],
++			self->win_cls[PAC_CLS_FAST], self->win_cls[PAC_CLS_SLOW],
++			self->win_cls[PAC_CLS_OTHER], self->last_other_nid,
++			(int)FMEM_NID, (int)SMEM_NID);
++	}
++	self->win_total_slow_access = 0;
++	self->win_slow_lat_sum = 0;
++	self->win_total_access = 0;
++	memset(self->win_cls, 0, sizeof(self->win_cls));
++	return 0;
++}
++
+ static inline int rt_rank_cmp(const void *a, const void *b, const void *pri)
+ {
+ 	// struct range_tree const *self = pri;
+ 	struct mrange const *ra = *(struct mrange **)a,
+ 			    *rb = *(struct mrange **)b;
++	// PAC: rank by cooled per-range criticality (accumulated slow-tier stall)
++	// instead of access frequency. Ascending: least critical first, most
++	// critical last, matching the frequency ranking convention. Ties (e.g.
++	// ranges with no slow-tier samples, all pac 0) fall through to the
++	// frequency order below, density first, so equal PAC never ranks worse
++	// than frequency mode would.
++	if (ranking_mode == RANKING_PAC) {
++		u64 da = mrange_pac(ra), db = mrange_pac(rb);
++		if (da != db)
++			return da < db ? -1 : 1;
++	}
+ 	// Comparison priority: freq >> age >> -(in_fmem + in_smem)
+ 	// Comparison priority: freq >> age
+ 	return mrange_freq(ra) - mrange_freq(rb)     ?:
