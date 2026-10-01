@@ -37,6 +37,7 @@ def demeter(pid: int = -1):
         "throttle_pulse_period_ms",
         "rtree_split_thresh",
         "rtree_exch_thresh",
+        "load_event",
     ]:
         exec(f"""if {modarg} := os.getenv("{modarg}", None):
             {modarg} = int({modarg})

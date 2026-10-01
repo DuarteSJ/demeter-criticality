@@ -1,0 +1,76 @@
+diff -ruN a/mm/demeter/module.c b/mm/demeter/module.c
+--- a/mm/demeter/module.c
++++ b/mm/demeter/module.c
+@@ -52,6 +52,11 @@
+ MODULE_PARM_DESC(rtree_exch_thresh,
+ 		 "Exchange threshold in bytes, defaults to 2^20");
+ 
++ulong load_event = LOAD_EVENT_LATENCY;
++module_param_named(load_event, load_event, ulong, 0444);
++MODULE_PARM_DESC(load_event,
++		 "Load sample event: 0=load latency (default), 1=L3 miss retired (sample period: load_l3_miss_sample_period)");
++
+ DEFINE_STATIC_KEY_TRUE(should_decay_sketch);
+ struct kmem_cache *list_head_cache;
+ 
+@@ -113,13 +118,24 @@
+ };
+ static inline void event_attrs_update_param(void)
+ {
+-	event_attrs[EVENT_LOAD].sample_period = load_latency_sample_period;
+-	event_attrs[EVENT_LOAD].config1 = load_latency_threshold;
++	if (load_event == LOAD_EVENT_L3_MISS) {
++		// Counts every L3-miss load (no latency tagging), so it is far
++		// denser than load latency at the same period. No threshold MSR.
++		event_attrs[EVENT_LOAD].config = MEM_LOAD_RETIRED_L3_MISS;
++		event_attrs[EVENT_LOAD].config1 = 0;
++		event_attrs[EVENT_LOAD].sample_period =
++			load_l3_miss_sample_period;
++	} else {
++		event_attrs[EVENT_LOAD].sample_period =
++			load_latency_sample_period;
++		event_attrs[EVENT_LOAD].config1 = load_latency_threshold;
++	}
+ 
+ 	// event_attrs[EVENT_LOAD].sample_period = load_l3_miss_sample_period;
+ 	event_attrs[EVENT_STORE].sample_period = retired_stores_sample_period;
+-	pr_info("%s: local_dram_miss_sample_period=%lu retired_stores_sample_period=%lu load_latency_sample_period=%lu load_latency_threshold=%lu\n",
+-		__func__, load_l3_miss_sample_period,
++	pr_info("%s: load_event=%lu load_config=%#llx local_dram_miss_sample_period=%lu retired_stores_sample_period=%lu load_latency_sample_period=%lu load_latency_threshold=%lu\n",
++		__func__, load_event, event_attrs[EVENT_LOAD].config,
++		load_l3_miss_sample_period,
+ 		retired_stores_sample_period, load_latency_sample_period,
+ 		load_latency_threshold);
+ }
+diff -ruN a/mm/demeter/module.h b/mm/demeter/module.h
+--- a/mm/demeter/module.h
++++ b/mm/demeter/module.h
+@@ -36,16 +36,28 @@
+ 	MEM_TRANS_RETIRED_LOAD_LATENCY = 0x01cd,
+ 	MEM_INST_RETIRED_ALL_STORES = 0x82d0,
+ 	MEM_LOAD_L3_MISS_RETIRED_LOCAL_DRAM = 0x01d3,
++	// All retired loads that missed L3, whatever served them. PACT samples
++	// the L3-miss load events; the tier is taken from the sample's physical
++	// address, so one supplier-agnostic event covers DRAM and CXL.
++	MEM_LOAD_RETIRED_L3_MISS = 0x20d1,
+ };
+ enum target_event {
+ 	EVENT_LOAD,
+ 	EVENT_STORE,
+ 	MAX_EVENTS,
+ };
++// Which event feeds EVENT_LOAD samples. Independent of the range ranking, so
++// any ranking can be fed load-latency samples (upstream) or L3-miss ones (PACT).
++enum load_event_kind {
++	LOAD_EVENT_LATENCY = 0, // MEM_TRANS_RETIRED.LOAD_LATENCY (upstream)
++	LOAD_EVENT_L3_MISS = 1, // MEM_LOAD_RETIRED.L3_MISS (PACT)
++};
+ extern struct perf_event_attr event_attrs[MAX_EVENTS];
+ 
+ extern ulong load_latency_sample_period;
+ extern ulong load_latency_threshold;
++extern ulong load_l3_miss_sample_period;
++extern ulong load_event;
+ extern ulong retired_stores_sample_period;
+ extern ulong throttle_pulse_width_ms;
+ extern ulong throttle_pulse_period_ms;
