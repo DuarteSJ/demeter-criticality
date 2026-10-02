@@ -48,6 +48,10 @@ class Bench(BaseModel):
     gdb: bool = False  # Whether enable gdb or not
     env: dict = {}  # Additional environment variables to pass to the launcher
     pml: bool = False  # Whether enable PML or not
+    # Guest idle=poll: vCPUs spin instead of HLT. Cuts the halt/wake-IPI VM
+    # exits that wakeup-heavy workloads (gups) cause, which also makes armed
+    # guest PMU events far cheaper. Off by default (upstream behaviour).
+    idle_poll: bool = False
 
     @property
     def dram_size(self) -> int:
@@ -223,6 +227,18 @@ class Bench(BaseModel):
         return self._benchmark(function_name(), **kwargs)
 
     def pagerank(self, **kwargs):
+        return self._benchmark(function_name(), **kwargs)
+
+    def bc(self, **kwargs):
+        return self._benchmark(function_name(), **kwargs)
+
+    def pr(self, **kwargs):
+        return self._benchmark(function_name(), **kwargs)
+
+    def cc(self, **kwargs):
+        return self._benchmark(function_name(), **kwargs)
+
+    def bfs(self, **kwargs):
         return self._benchmark(function_name(), **kwargs)
 
     def xsbench(self, **kwargs):

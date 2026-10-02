@@ -123,6 +123,8 @@ class Vm(BaseModel):
             "transparent_hugepage=never",
             "cgroup_no_v1=all",
         ]
+        if self.bench.idle_poll:
+            cmdline.append("idle=poll")
         match design:
             # case Kernel.hemem:
             #     # The first 1G exists due to historical reason on x86_64

@@ -59,6 +59,47 @@ def pagerank_args(
     return args
 
 
+# PACT's headline workload (bc-kron). The graph is pre-generated on the host
+# (workload/gapbs/converter -g 26 -b bin/kron26.sg) so the VM does not need
+# the edge-list buffer that in-memory generation uses (~2x peak memory).
+def bc_args(
+    bin: Path | str = Path("/data/bc"),
+    f: Path | str = Path("/data/kron26.sg"),
+    # Not "n": fire matches abbreviated flags, so --n would set Bench --num
+    # (the number of VMs) instead.
+    trials: int = 10,  # (runtime)
+):
+    bin, f = str(bin), str(f)
+    args = f"{bin} -f {f} -n {trials} "
+    return args
+
+
+# PACT's other GAPBS graph kernels, same conventions as bc_args (graph
+# pre-generated on the host, trial count named "trials"). Defaults: kron26.
+def pr_args(
+    bin: Path | str = Path("/data/pr"),
+    f: Path | str = Path("/data/kron26.sg"),
+    trials: int = 10,  # (runtime)
+):
+    return f"{bin} -f {f} -n {trials} "
+
+
+def cc_args(
+    bin: Path | str = Path("/data/cc"),
+    f: Path | str = Path("/data/kron26.sg"),
+    trials: int = 50,  # (runtime)
+):
+    return f"{bin} -f {f} -n {trials} "
+
+
+def bfs_args(
+    bin: Path | str = Path("/data/bfs"),
+    f: Path | str = Path("/data/kron26.sg"),
+    trials: int = 100,  # (runtime)
+):
+    return f"{bin} -f {f} -n {trials} "
+
+
 def xsbench_args(
     bin: Path | str = Path("/data/XSBench"),
     t: int = 4,  # threads

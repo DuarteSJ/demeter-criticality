@@ -26,6 +26,9 @@ $(LIBLINEAR_BIN): workload/liblinear/Makefile
 	make -C workload/liblinear
 
 PAGERANK_BIN := workload/gapbs/pr workload/gapbs/benchmark/graphs/twitter.sg
+# bc-kron and the other GAPBS kernels PACT uses; the graph itself:
+# workload/gapbs/converter -g 26 -b bin/kron26.sg
+BC_BIN := workload/gapbs/bc workload/gapbs/cc workload/gapbs/bfs
 $(PAGERANK_BIN): workload/gapbs/Makefile
 	make -C workload/gapbs
 
@@ -41,7 +44,7 @@ all: $(GUPS_BIN) $(BTREE_BIN) $(BWAVES_BIN) $(GRAPH500_BIN) \
 	$(LIBLINEAR_BIN) $(PAGERANK_BIN) $(SILO_BIN) $(XSBENCH_BIN)
 
 install: $(GUPS_BIN) $(BTREE_BIN) $(BWAVES_BIN) $(GRAPH500_BIN) \
-	$(LIBLINEAR_BIN) $(PAGERANK_BIN) $(SILO_BIN) $(XSBENCH_BIN)
+	$(LIBLINEAR_BIN) $(PAGERANK_BIN) $(SILO_BIN) $(XSBENCH_BIN) $(BC_BIN)
 	mkdir -p bin
 	cp -vt bin $?
 
